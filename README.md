@@ -54,7 +54,27 @@ python3 ./bambu-api-decrypt.py ./<your-trigger-response.json>
 
 ## MacOS
 
-No implemented. But the Linux bash script can probably be modified pretty easily to do so. 
+The same `capture-bambu-cert.sh` script works on macOS.
+
+Install Wireshark from https://www.wireshark.org (or `brew install --cask wireshark`) and make sure ChmodBPF is installed with it, so you can capture without root. Your user has to be in the `access_bpf` group; log out and back in after installing. If the command-line tools (`dumpcap`, `tshark`, `editcap`) aren't on your `PATH`, the script picks them up from `Wireshark.app` automatically. Python 3 is needed for the decryptor (`xcode-select --install` or `brew install python`).
+
+Install Bambu Studio from https://github.com/bambulab/BambuStudio/releases/latest (or the Bambu Lab website). Start it and go through the initial setup, including downloading the network plugin. You don't need to log in or connect to any printers. Then quit it completely (Cmd+Q).
+
+Run the capture script. With no argument it uses `/Applications/BambuStudio.app`; you can also pass a different `.app` path.
+```bash
+bash ./capture-bambu-cert.sh
+# or
+bash ./capture-bambu-cert.sh ~/Applications/BambuStudio.app
+```
+
+The script runs the binary inside the bundle directly, not through `open`, because that is the only way Studio inherits `SSLKEYLOGFILE`.
+
+If everything worked it will print a list of files it generated. One of these should end in `trigger-response.json`. 
+
+Run the python decryptor against that JSON file.
+```bash
+python3 ./bambu-api-decrypt.py ./<your-trigger-response.json>
+```
 
 ## Compatible Versions
 

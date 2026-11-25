@@ -1,0 +1,12 @@
+# Capture output (capture-bambu-cert.sh / Capture-BambuCert.ps1)
+*.pcap
+*.pcapng
+*-keys.log
+*-trigger-url.txt
+*-trigger-response.json
+
+# Decoder output (bambu-api-decrypt.py) -- certs, CRL and private key
+*.pem
+
+# macOS
+.DS_Store

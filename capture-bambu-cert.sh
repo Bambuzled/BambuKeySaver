@@ -19,9 +19,27 @@
 #
 # The response JSON feeds straight into bambu-api-decrypt.py.
 #
-# Linux counterpart of Capture-BambuCert.ps1.
+# Linux counterpart of Capture-BambuCert.ps1.  Also runs on macOS (including
+# the stock bash 3.2), where the Bambu Studio path is optional and defaults to
+# /Applications/BambuStudio.app/Contents/MacOS/BambuStudio.  A .app bundle path
+# is accepted too.
 
 set -uo pipefail
+
+os=$(uname -s)
+is_macos=0
+[[ $os == Darwin ]] && is_macos=1
+
+readonly DEFAULT_MACOS_STUDIO=/Applications/BambuStudio.app/Contents/MacOS/BambuStudio
+
+# bash 3.2 (macOS /bin/bash) only accepts whole-second `read -t` values, and
+# rejects fractional ones outright, which turns the wait loop below into a
+# busy spin.  Use fractions only where bash supports them.
+if (( BASH_VERSINFO[0] >= 4 )); then
+    tick=0.5; key_tick=0.01
+else
+    tick=1;   key_tick=''
+fi
 
 readonly DEFAULT_TRIGGER='(http.host == "api.bambulab.com" and http.request.uri contains "/v1/iot-service/api/user/applications/") or (http2.headers.authority == "api.bambulab.com" and http2.headers.path contains "/v1/iot-service/api/user/applications/")'
 
@@ -36,8 +54,21 @@ close_studio=0
 list_interfaces=0
 
 usage() {
+    if (( is_macos )); then
+        cat <<EOF
+usage: ${0##*/} [options] [STUDIO]
+
+  STUDIO                 the Bambu Studio .app bundle, or the executable in it
+                         (default: $DEFAULT_MACOS_STUDIO)
+EOF
+    else
+        cat <<EOF
+usage: ${0##*/} [options] STUDIO
+
+  STUDIO                 the Bambu Studio AppImage (required)
+EOF
+    fi
     cat <<EOF
-usage: ${0##*/} [options] /path/to/Bambu_Studio.AppImage
 
   -i, --interface NAME   capture interface (default: the default route's)
   -s, --seconds N        capture window, the backstop if the trigger never
@@ -54,10 +85,21 @@ usage: ${0##*/} [options] /path/to/Bambu_Studio.AppImage
   -h, --help             this text
 
 examples:
+EOF
+    if (( is_macos )); then
+        cat <<EOF
+  ${0##*/}                                  # uses the default STUDIO
+  ${0##*/} ~/Applications/BambuStudio.app
+  ${0##*/} -s 90 -g 10
+  ${0##*/} -t 'http.request.uri contains "app_cert"'
+EOF
+    else
+        cat <<EOF
   ${0##*/} ~/Downloads/Bambu_Studio_ubuntu-24.04.AppImage
   ${0##*/} -s 90 -g 10 ~/Bambu.AppImage
   ${0##*/} -t 'http.request.uri contains "app_cert"' ~/Bambu.AppImage
 EOF
+    fi
 }
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -85,20 +127,51 @@ done
 for tool in dumpcap editcap tshark; do
     command -v "$tool" >/dev/null || die "$tool not found. Install Wireshark (wireshark-common / wireshark-cli)."
 done
-for tool in setsid pgrep ps; do
-    command -v "$tool" >/dev/null || die "$tool not found (util-linux / procps)."
+for tool in pgrep ps; do
+    command -v "$tool" >/dev/null || die "$tool not found (procps)."
 done
+if [[ $os == Linux ]]; then
+    command -v setsid >/dev/null || die "setsid not found (util-linux)."
+fi
 
 [[ $seconds =~ ^[0-9]+$ ]] || die "--seconds must be a whole number: $seconds"
 [[ $grace   =~ ^[0-9]+$ ]] || die "--grace must be a whole number: $grace"
 
 if (( list_interfaces )); then dumpcap -D; exit 0; fi
 
+if [[ -z $appimage ]] && (( is_macos )); then
+    appimage=$DEFAULT_MACOS_STUDIO
+    [[ -e $appimage ]] || die "Bambu Studio not found at the default $appimage -- pass its path."
+    printf 'Studio        = %s (default)\n' "$appimage"
+fi
 [[ -n $appimage ]] || { usage >&2; exit 2; }
+
+abspath() {  # portable `readlink -f` (BSD readlink only learned -f in macOS 12.3)
+    local p=$1 d
+    while [[ -L $p ]]; do
+        d=$(readlink -- "$p")
+        [[ $d == /* ]] && p=$d || p="$(dirname -- "$p")/$d"
+    done
+    if [[ -d $p ]]; then (cd -- "$p" && pwd -P)
+    else printf '%s/%s\n' "$(cd -- "$(dirname -- "$p")" && pwd -P)" "${p##*/}"; fi
+}
+
+# macOS: accept the .app bundle and run the executable inside it directly.
+# `open` would not pass SSLKEYLOGFILE through to the app.
+if [[ -d $appimage && $appimage == *.app || -d ${appimage%/} && ${appimage%/} == *.app ]]; then
+    app_bundle=$(abspath "${appimage%/}")
+    appimage=''
+    for cand in "$app_bundle"/Contents/MacOS/*; do
+        [[ -f $cand && -x $cand ]] && { appimage=$cand; break; }
+    done
+    [[ -n $appimage ]] || die "no executable found in $app_bundle/Contents/MacOS"
+fi
 [[ -f $appimage ]] || die "not a file: $appimage"
 [[ -x $appimage ]] || die "not executable: $appimage  (chmod +x it first)"
-appimage=$(readlink -f -- "$appimage")
+appimage=$(abspath "$appimage")
 appimage_name=${appimage##*/}
+
+fsize() { wc -c < "$1" | tr -d ' '; }
 
 # How to turn hex back into bytes -- tshark prints FT_BYTES fields as hex.
 if command -v xxd >/dev/null; then          hex_decoder=xxd
@@ -122,11 +195,18 @@ studio_pids() {
     {
         for pid in $(pgrep -f -- "$appimage_name" 2>/dev/null); do
             [[ $pid == "$$" ]] && continue
-            exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || continue
-            # the AppImage runtime itself, or the binary inside its mount
-            [[ $exe == "$appimage" || $exe == /tmp/.mount_* ]] && printf '%s\n' "$pid"
+            if [[ $os == Linux ]]; then
+                exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || continue
+                # the AppImage runtime itself, or the binary inside its mount
+                [[ $exe == "$appimage" || $exe == /tmp/.mount_* ]] && printf '%s\n' "$pid"
+            else
+                # no /proc on macOS; ps reports the executable's full path
+                exe=$(ps -o comm= -p "$pid" 2>/dev/null) || continue
+                [[ $exe == "$appimage" ]] && printf '%s\n' "$pid"
+            fi
         done
         pgrep -x bambu-studio 2>/dev/null
+        pgrep -x "$appimage_name" 2>/dev/null
     } | sort -un
 }
 
@@ -138,6 +218,8 @@ fi
 
 if (( EUID == 0 )); then
     warn "running as root: Bambu Studio will run as root too, and will write to root's config."
+elif (( is_macos )); then
+    [[ -r /dev/bpf0 ]] || warn "no read access to /dev/bpf*. Install Wireshark's ChmodBPF helper, or run: sudo chmod o+r /dev/bpf*"
 elif command -v getcap >/dev/null && ! getcap "$(command -v dumpcap)" 2>/dev/null | grep -q cap_net_raw; then
     warn "dumpcap has no cap_net_raw. If the capture fails, run:
            sudo dpkg-reconfigure wireshark-common   # then log out and back in
@@ -160,7 +242,11 @@ printf 'SSLKEYLOGFILE = %s\n' "$keylog"
 
 # --- pick an interface ------------------------------------------------------
 if [[ -z $interface ]]; then
-    interface=$(ip -o route show default 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+    if (( is_macos )); then
+        interface=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}')
+    else
+        interface=$(ip -o route show default 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+    fi
 fi
 if [[ -z $interface ]]; then
     warn "could not auto-detect the interface; falling back to 1. Use --list-interfaces to choose."
@@ -169,7 +255,7 @@ fi
 printf 'Interface     = %s\n' "$interface"
 
 # --- cleanup ----------------------------------------------------------------
-tmpdir=$(mktemp -d -t bambu-cap-XXXXXXXX)
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/bambu-cap-XXXXXXXX")
 dump_pid=''
 mon_pid=''
 studio_pid=''
@@ -280,8 +366,17 @@ fi
 # --- launch Bambu Studio ----------------------------------------------------
 # setsid: its own process group, so it can be killed as a unit later.
 printf 'Launching %s\n' "$appimage"
-setsid "$appimage" > "$tmpdir/studio.log" 2>&1 &
-studio_pid=$!
+if [[ $os == Linux ]]; then
+    setsid "$appimage" > "$tmpdir/studio.log" 2>&1 &
+    studio_pid=$!
+else
+    # no setsid on macOS; job control gives the background job its own group
+    set -m
+    "$appimage" > "$tmpdir/studio.log" 2>&1 &
+    studio_pid=$!
+    set +m
+fi
+disown "$studio_pid" 2>/dev/null || true   # no "Terminated" notice when it is closed
 
 # --- wait -------------------------------------------------------------------
 # Rebuild the request URL from the monitor's fields:
@@ -295,7 +390,7 @@ trigger_url() {
 triggered=0
 deadline=$(( $(date +%s) + seconds ))
 while (( $(date +%s) < deadline )) && kill -0 "$dump_pid" 2>/dev/null; do
-    if [[ -n $mon_pid ]] && IFS= read -r -t 0.5 line <&3; then
+    if [[ -n $mon_pid ]] && IFS= read -r -t "$tick" line <&3; then
         if [[ -n ${line//[[:space:]|]/} ]]; then
             triggered=1
             url=$(trigger_url "$line")
@@ -309,12 +404,12 @@ while (( $(date +%s) < deadline )) && kill -0 "$dump_pid" 2>/dev/null; do
         fi
         continue
     fi
-    [[ -z $mon_pid ]] && sleep 0.5
+    [[ -z $mon_pid ]] && sleep "$tick"
 
-    if [[ -t 0 ]] && read -rsn1 -t 0.01 _key; then break; fi   # any key stops
+    if [[ -n $key_tick && -t 0 ]] && read -rsn1 -t "$key_tick" _key; then break; fi   # any key stops
 
     left=$(( deadline - $(date +%s) ))
-    keys=$(grep -c '^[A-Z_]\+ ' "$keylog" 2>/dev/null); keys=${keys:-0}
+    keys=$(grep -c -E '^[A-Z_]+ ' "$keylog" 2>/dev/null); keys=${keys:-0}
     printf '\r  %s... %3ss left, %s key log lines   ' \
            "$( [[ -n $mon_pid ]] && printf watching || printf capturing )" \
            "$left" "$keys"
@@ -332,7 +427,7 @@ if (( triggered || close_studio )); then
 fi
 
 # --- inject the secrets -----------------------------------------------------
-key_lines=$(grep -c '^[A-Z_]\+ ' "$keylog" 2>/dev/null); key_lines=${key_lines:-0}
+key_lines=$(grep -c -E '^[A-Z_]+ ' "$keylog" 2>/dev/null); key_lines=${key_lines:-0}
 if (( key_lines == 0 )); then
     warn "the key log is empty -- Bambu Studio did not honour SSLKEYLOGFILE this run."
     warn "the raw capture is still at $raw_pcap but its TLS cannot be decrypted."
@@ -384,7 +479,7 @@ if [[ -n $trigger_filter ]]; then
         done
 
         if [[ -n $hex ]] && hex_to_file "$hex" "$trig_json"; then
-            printf 'Wrote %s (%s bytes)\n' "$trig_json" "$(stat -c %s "$trig_json")"
+            printf 'Wrote %s (%s bytes)\n' "$trig_json" "$(fsize "$trig_json")"
         else
             warn "no response body found for the triggered request."
         fi
@@ -394,5 +489,5 @@ fi
 printf '\nFiles written to %s :\n' "$cwd"
 for f in "$cwd/$base"*; do
     [[ -e $f ]] || continue
-    printf '  %-40s %10s bytes\n' "${f##*/}" "$(stat -c %s "$f")"
+    printf '  %-40s %10s bytes\n' "${f##*/}" "$(fsize "$f")"
 done
